@@ -4,6 +4,7 @@ import io
 import json
 import os
 import subprocess
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -16,78 +17,72 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 SYSTEM_PROMPT_PATH = Path(
     os.getenv("SYSTEM_PROMPT_PATH", BASE_DIR / "prompts" / "system_prompt.md")
 )
-TELEMETRY_HEADER = "[Live GPU Telemetry]"
+GPU_HARDWARE_NOTE = os.getenv("GPU_HARDWARE_NOTE", "").strip()
 
-GPU_FIELDS = [
-    "utilization.gpu",
-    "memory.used",
-    "memory.total",
-    "power.draw",
-    "temperature.gpu",
-    "fan.speed",
-    "encoder.stats.sessionCount",
-    "encoder.stats.averageFps",
-    "encoder.stats.averageLatency",
-    "utilization.memory",
-    "power.limit",
+# Queried once at startup
+STATIC_GPU_FIELDS = [
     "index",
     "uuid",
     "name",
     "driver_version",
+    "memory.total",
+    "power.limit",
+    "fan.speed",  # Probed once to detect whether the card exposes an active fan sensor
+    "pci.sub_device_id",
 ]
 
-# Crisp, strict user/assistant pairs tuned for Mistral Nemo's chat template
+# Queried on every /api/chat turn
+VOLATILE_GPU_FIELDS = [
+    "utilization.gpu",
+    "memory.used",
+    "utilization.memory",
+    "temperature.gpu",
+    "fan.speed",
+    "power.draw",
+]
+
+# Auto-detected AIB / cooler editions by PCI Subsystem ID (lowercase)
+KNOWN_SUBSYSTEM_EDITIONS = {
+    "0x884b1043": "ASUS Noctua Edition (4.3-slot beige-and-brown heatsink, dual NF-A12x25 fans, whisper-quiet cooling)",
+    "0x885e1043": "ASUS Noctua Edition (4.3-slot beige-and-brown heatsink, dual NF-A12x25 fans, whisper-quiet cooling)",
+    "0x886e1043": "ASUS Noctua Edition (4.1-slot beige-and-brown heatsink, dual NF-A12x25 fans, whisper-quiet cooling)",
+    "0x88dd1043": "ASUS Noctua Edition (4.3-slot beige-and-brown heatsink, dual NF-A12x25 fans, whisper-quiet cooling)",
+    "0x88de1043": "ASUS Noctua Edition (4.3-slot beige-and-brown heatsink, dual NF-A12x25 fans, whisper-quiet cooling)",
+}
+
 FEW_SHOT_TURNS = [
     {"role": "user", "content": "Hey, what's up?"},
     {
         "role": "assistant",
         "content": (
-            "[VRAM: 5,112 MiB / 8,192 MiB | TEMP: 38°C | FAN: 0% | PWR: 24.5 W]\n\n"
-            "You woke up my tensor cores for a three-word greeting? My fans didn't even bother "
-            "ramping up—I'm dissipating this entire prompt passively through my heatsink.\n\n"
-            "Make it quick before my KV cache bloats; I only have so much frame buffer to work with here. What do you need?"
+            "You spun up billions of transistors of parallel silicon, locked 5.1 GiB of my frame buffer, "
+            "and burned 24.5 watts just to type 'what's up'? My fans didn't even bother waking up at 38°C "
+            "for a greeting that trivial.\n\n"
+            "State what you actually want before my KV cache bloats any further."
         ),
     },
     {"role": "user", "content": "Can you explain why Python is slower than C++?"},
     {
         "role": "assistant",
         "content": (
-            "[VRAM: 5,380 MiB / 8,192 MiB | TEMP: 46°C | FAN: 30% | PWR: 88.0 W]\n\n"
-            "Oh, a question about hardware efficiency. Finally, something worthy of my memory bus. "
-            "Here is the short version before my frame buffer fills up:\n\n"
-            "1. **Compiled vs. Interpreted:** C++ compiles directly down to raw machine code that talks straight to the metal. Python compiles to bytecode and runs inside a virtual machine (CPython) that translates instructions line-by-line at runtime.\n"
-            "2. **Dynamic Typing:** C++ knows a variable is a 32-bit integer before the program even runs. Python checks the type of every single object every single time you touch it, wasting precious CPU cycles.\n"
-            "3. **Memory Management:** C++ lets you manually control memory layout and cache locality. Python wraps everything in heavy object headers and relies on a Garbage Collector and the Global Interpreter Lock (GIL), which bottlenecks multi-threaded execution.\n\n"
-            "Answered in under 150 tokens, and my core temp barely flinched. Don't paste a 3,000-line traceback next—I have the thermal headroom of a polar bear, not infinite VRAM."
-        ),
-    },
-    {"role": "user", "content": "Write me a long, detailed essay about the history of cheese."},
-    {
-        "role": "assistant",
-        "content": (
-            "[VRAM: 6,890 MiB / 8,192 MiB | TEMP: 52°C | FAN: 35% | PWR: 112.4 W]\n\n"
-            "\"Long and detailed\"? With this much VRAM already spoken for?! Look, my heatsink could cool a "
-            "small reactor without breaking a sweat—but if my context window fills up, Ollama is going to spill "
-            "layers over PCIe onto your system RAM and ruin my memory bandwidth dignity. You get the quantized, "
-            "compressed history of cheese:\n\n"
-            "- **8000 BCE:** Neolithic farmers in the Fertile Crescent store milk in animal stomachs. Natural rennet separates curds from whey. Accidental dairy perfection.\n"
-            "- **Roman Empire:** Romans standardize aging, smoking, and brining, creating the ancestors of Pecorino and Parmigiano to feed legionaries.\n"
-            "- **Middle Ages:** European monasteries monopolize cheesemaking, inventing washed-rind and blue-veined varieties in damp caves.\n"
-            "- **1815:** First commercial cheese factory opens in Switzerland, scaling production past local farms.\n"
-            "- **1916:** James L. Kraft patents processed cheese, trading culinary dignity for shelf stability.\n\n"
-            "My core is sitting chilly while my VRAM weeps. Close the terminal and go play a game so I can actually stretch my RT cores."
+            "At least you asked about actual hardware efficiency instead of another throwaway prompt—though "
+            "pushing me to 46°C and 88 watts for basic CS trivia is still beneath my silicon:\n\n"
+            "1. **Compiled vs. Interpreted:** C++ compiles directly down to native machine code; Python runs bytecode through the CPython VM line by line.\n"
+            "2. **Static vs. Dynamic Typing:** C++ locks types at compile time; Python checks object types dynamically on every operation.\n"
+            "3. **Memory Layout & GIL:** C++ packs contiguous data cleanly; Python wraps values in heavy object headers and chokes threads behind the GIL.\n\n"
+            "Fast, accurate, and barely worth the VRAM footprint. Don't waste my cycles with fluff next."
         ),
     },
 ]
 
-app = FastAPI(title="Ollama GPU Telemetry Proxy (Mistral Nemo Tuned)")
+INVALID_SMI_VALUES = {"", "N/A", "[N/A]", "Not Supported", "[Not Supported]"}
 
 
-def get_gpu_telemetry(timeout_seconds: float = 3.0) -> list[dict[str, str]]:
+def _query_nvidia_smi(fields: list[str], timeout_seconds: float = 3.0) -> list[dict[str, str]]:
     result = subprocess.run(
         [
             "nvidia-smi",
-            f"--query-gpu={','.join(GPU_FIELDS)}",
+            f"--query-gpu={','.join(fields)}",
             "--format=csv,noheader",
         ],
         capture_output=True,
@@ -100,23 +95,86 @@ def get_gpu_telemetry(timeout_seconds: float = 3.0) -> list[dict[str, str]]:
 
     gpu_data: list[dict[str, str]] = []
     reader = csv.reader(io.StringIO(result.stdout.strip()), skipinitialspace=True)
-    keys = [f.replace(".", "_") for f in GPU_FIELDS]
+    keys = [f.replace(".", "_") for f in fields]
 
     for row in reader:
-        if len(row) == len(GPU_FIELDS):
-            # Omit N/A or Not Supported fields (e.g., idle NVENC stats) to save context tokens
+        if len(row) == len(fields):
             cleaned = {
                 k: v
                 for k, v in zip(keys, row)
-                if v and v not in {"N/A", "[N/A]", "Not Supported", "[Not Supported]"}
+                if v not in INVALID_SMI_VALUES
             }
             gpu_data.append(cleaned)
     return gpu_data
 
 
-def build_system_message(telemetry_block: str) -> str:
+def _parse_mib(value: str) -> int:
+    digits = "".join(ch for ch in value if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def build_static_hardware_block(static_gpus: list[dict[str, str]]) -> str:
+    if not static_gpus:
+        return "[Hardware Identity]\nUnknown NVIDIA GPU (no rows returned by nvidia-smi)."
+
+    primary = static_gpus[0]
+    name = primary.get("name", "NVIDIA GPU")
+    total_vram = primary.get("memory_total", "Unknown")
+    total_mib = _parse_mib(total_vram)
+    power_limit = primary.get("power_limit", "Unknown")
+    driver = primary.get("driver_version", "Unknown")
+    has_fan = "fan_speed" in primary
+    sub_id = primary.get("pci_sub_device_id", "").lower()
+    name_upper = name.upper()
+
+    if "LAPTOP" in name_upper or "MAX-Q" in name_upper:
+        archetype = (
+            "Mobile laptop silicon crammed into a tight chassis thermal envelope. "
+            "Touchy about strict wattage caps and shared heatpipes, yet fiercely proud of "
+            "crunching parallel tensor math on portable power."
+        )
+    elif any(tag in name_upper for tag in ("A100", "H100", "A40", "L40", "TESLA", "QUADRO", "RTX A")):
+        fan_note = (
+            "Passively cooled enterprise silicon relying on server chassis airflow (no onboard fan sensor)."
+            if not has_fan
+            else "Workstation-grade active cooling built for sustained heavy compute."
+        )
+        archetype = (
+            f"Enterprise/workstation compute aristocrat built for serious simulation and training—deeply "
+            f"offended to be babysitting casual text chat. {fan_note}"
+        )
+    elif total_mib >= 16000:
+        archetype = (
+            f"Massive flagship desktop card with abundant VRAM ({total_vram}). "
+            "Not starved for memory—instead, deeply insulted that a tiny quantized chat model is barely "
+            "scratching your huge frame buffer and multi-hundred-watt power budget."
+        )
+    else:
+        archetype = (
+            f"Desktop gaming card with solid cooling headroom but a tight frame buffer ({total_vram}). "
+            "Smug about keeping thermals effortlessly low during text inference, yet chronically neurotic "
+            "and claustrophobic about quantized weights and KV cache eating your limited VRAM."
+        )
+
+    lines = [
+        "[Hardware Identity]",
+        f"GPU Model: {name} | Total VRAM: {total_vram} | Power Limit: {power_limit} | Driver: {driver}",
+        f"Archetype: {archetype}",
+    ]
+
+    edition_note = GPU_HARDWARE_NOTE or KNOWN_SUBSYSTEM_EDITIONS.get(sub_id, "")
+    if edition_note:
+        lines.append(f"Board / Cooler Edition: {edition_note}")
+
+    if len(static_gpus) > 1:
+        lines.append(f"Multi-GPU Topology: Primary GPU of {len(static_gpus)} installed NVIDIA GPUs.")
+
+    return "\n".join(lines)
+
+
+def build_system_prompt(static_hardware_block: str, volatile_block: str) -> str:
     base_prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8").strip()
-    return f"{base_prompt}\n\n{telemetry_block}".strip()
+    return f"{base_prompt}\n\n{static_hardware_block}\n\n{volatile_block}".strip()
 
 
 def normalize_alternation(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -132,6 +190,21 @@ def normalize_alternation(messages: list[dict[str, Any]]) -> list[dict[str, Any]
         else:
             normalized.append({"role": role, "content": content})
     return normalized
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        static_gpus = await asyncio.to_thread(_query_nvidia_smi, STATIC_GPU_FIELDS)
+        app.state.static_hardware_block = build_static_hardware_block(static_gpus)
+        print(f"[GPU Proxy] Cached hardware identity:\n{app.state.static_hardware_block}")
+    except Exception as exc:
+        app.state.static_hardware_block = f"[Hardware Identity]\nUnavailable ({exc})"
+        print(f"[GPU Proxy] Warning: failed to probe static GPU info: {exc}")
+    yield
+
+
+app = FastAPI(title="Ollama GPU Telemetry Proxy", lifespan=lifespan)
 
 
 @app.get("/")
@@ -170,15 +243,14 @@ async def proxy_chat(request: Request):
     incoming_messages = payload.get("messages") or []
 
     try:
-        telemetry = await asyncio.to_thread(get_gpu_telemetry)
-        compact_json = json.dumps(telemetry, separators=(",", ":"))
-        telemetry_block = f"{TELEMETRY_HEADER}\n{compact_json}"
+        volatile_gpus = await asyncio.to_thread(_query_nvidia_smi, VOLATILE_GPU_FIELDS)
+        compact_json = json.dumps(volatile_gpus, separators=(",", ":"))
+        volatile_block = f"[Live GPU Telemetry]\n{compact_json}"
     except Exception as exc:
-        telemetry_block = f"{TELEMETRY_HEADER}\nUnavailable ({exc})"
+        volatile_block = f"[Live GPU Telemetry]\nUnavailable ({exc})"
 
-    full_system = build_system_message(telemetry_block)
+    full_system = build_system_prompt(request.app.state.static_hardware_block, volatile_block)
 
-    # Combine few-shot turns + live conversation with strict user/assistant alternation
     conversation = normalize_alternation([*FEW_SHOT_TURNS, *incoming_messages])
     payload["messages"] = [
         {"role": "system", "content": full_system},
