@@ -1,6 +1,0 @@
-FROM mistral-nemo:12b
-
-PARAMETER num_ctx 4096
-PARAMETER temperature 0.88
-PARAMETER min_p 0.04
-PARAMETER repeat_penalty 1.1
