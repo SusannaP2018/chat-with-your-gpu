@@ -78,7 +78,7 @@ FEW_SHOT_TURNS = [
 INVALID_SMI_VALUES = {"", "N/A", "[N/A]", "Not Supported", "[Not Supported]"}
 
 
-def _query_nvidia_smi(fields: list[str], timeout_seconds: float = 3.0) -> list[dict[str, str]]:
+def _query_nvidia_smi(fields: list[str], timeout_seconds: float = 8.0) -> list[dict[str, str]]:
     result = subprocess.run(
         [
             "nvidia-smi",
