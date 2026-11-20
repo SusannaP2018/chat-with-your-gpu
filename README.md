@@ -58,3 +58,7 @@ ollama run sentient-gpu
 ## Customization
 
 * **Custom Cooler / AIB Edition:** Set `GPU_HARDWARE_NOTE` in your environment (e.g., `GPU_HARDWARE_NOTE="EVGA FTW3 Ultra"`) to inject custom board details into the hardware profile.
+
+## Quirks
+
+* **The model acts weird/only gives generic responses in Open-WebUI:** This is a bug in OpenWebUI. In Admin panel > Models, uncheck *Builtin tools*.
