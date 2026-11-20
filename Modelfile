@@ -1,6 +1,6 @@
-FROM qwen2.5:7b-instruct-q4_K_M
+FROM mistral-nemo:12b
 
 PARAMETER num_ctx 4096
-PARAMETER temperature 0.95
-PARAMETER top_p 0.92
-PARAMETER repeat_penalty 1.12
+PARAMETER temperature 0.85
+PARAMETER min_p 0.03
+PARAMETER repeat_penalty 1.08

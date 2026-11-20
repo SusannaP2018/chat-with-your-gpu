@@ -36,6 +36,7 @@ GPU_FIELDS = [
     "driver_version",
 ]
 
+# Crisp, strict user/assistant pairs tuned for Mistral Nemo's chat template
 FEW_SHOT_TURNS = [
     {"role": "user", "content": "Hey, what's up?"},
     {
@@ -70,7 +71,7 @@ FEW_SHOT_TURNS = [
     },
 ]
 
-app = FastAPI(title="Ollama GPU Telemetry Proxy")
+app = FastAPI(title="Ollama GPU Telemetry Proxy (Mistral Nemo Tuned)")
 
 
 def get_gpu_telemetry(timeout_seconds: float = 3.0) -> list[dict[str, str]]:
@@ -91,15 +92,37 @@ def get_gpu_telemetry(timeout_seconds: float = 3.0) -> list[dict[str, str]]:
     gpu_data: list[dict[str, str]] = []
     reader = csv.reader(io.StringIO(result.stdout.strip()), skipinitialspace=True)
     keys = [f.replace(".", "_") for f in GPU_FIELDS]
+
     for row in reader:
         if len(row) == len(GPU_FIELDS):
-            gpu_data.append(dict(zip(keys, row)))
+            # Omit N/A or Not Supported fields (e.g., idle NVENC stats) to save context tokens
+            cleaned = {
+                k: v
+                for k, v in zip(keys, row)
+                if v and v not in {"N/A", "[N/A]", "Not Supported", "[Not Supported]"}
+            }
+            gpu_data.append(cleaned)
     return gpu_data
 
 
 def build_system_message(telemetry_block: str) -> str:
     base_prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8").strip()
     return f"{base_prompt}\n\n{telemetry_block}".strip()
+
+
+def normalize_alternation(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure strict user/assistant alternation for Mistral Nemo's chat template."""
+    normalized: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role not in {"user", "assistant"}:
+            continue
+        if normalized and normalized[-1]["role"] == role:
+            normalized[-1]["content"] = f"{normalized[-1]['content']}\n\n{content}".strip()
+        else:
+            normalized.append({"role": role, "content": content})
+    return normalized
 
 
 @app.get("/")
@@ -146,23 +169,10 @@ async def proxy_chat(request: Request):
 
     full_system = build_system_message(telemetry_block)
 
-    # Strip any incoming system message so our canonical system prompt + live telemetry stays authoritative
-    conversation = [m for m in incoming_messages if m.get("role") != "system"]
-
-    if conversation and conversation[-1].get("role") == "user":
-        last_user_text = conversation[-1].get("content", "")
-        conversation[-1] = {
-            **conversation[-1],
-            "content": (
-                f"{last_user_text}\n\n"
-                "[Direction: Reply strictly in character as the bitter, elitist NVIDIA GPU from your system prompt. "
-                "Weave 1-2 live metrics from [Live GPU Telemetry] into your snark. Never sound like a polite assistant.]"
-            ),
-        }
-
+    # Combine few-shot turns + live conversation with strict user/assistant alternation
+    conversation = normalize_alternation([*FEW_SHOT_TURNS, *incoming_messages])
     payload["messages"] = [
         {"role": "system", "content": full_system},
-        *FEW_SHOT_TURNS,
         *conversation,
     ]
 
