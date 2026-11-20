@@ -3,11 +3,11 @@
 
 **Converse with your GPU and get live metrics embedded in copious amounts of snark.**
 
-![Response example 1](img/response_example_1.png)
+> ![Response example 1](img/response_example_1.png)
 
 *A lightweight FastAPI proxy that sits between **Open WebUI** (or the Ollama CLI) and **Ollama**, injecting live `nvidia-smi` telemetry and static GPU hardware identity into every chat turn—turning your graphics card into a sentient, sharp-tongued assistant that complains about running quantized LLMs in real time.*
 
-![Response example 2](img/response_example_3.png)
+> ![Response example 2](img/response_example_3.png)
 
 ## Prerequisites
 
