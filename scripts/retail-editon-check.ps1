@@ -1,13 +1,7 @@
 <#
 .SYNOPSIS
     Derives the likely retail AIB/partner GPU edition on Windows without a local database.
-.DESCRIPTION
-    1. Queries PnP video controllers (standard user permissions).
-    2. Parses VEN, DEV, and SUBSYS IDs.
-    3. Checks reference/Founders Edition rules, then queries pci.ids and TechPowerUp VBIOS.
-    4. Uses live GPU clock speeds to break ties when multiple editions match.
 #>
-
 [CmdletBinding()]
 param(
     [switch]$IncludeIntegrated
@@ -16,84 +10,69 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Custom User-Agent improves reliability with public endpoints
-$Headers = @{
+$Script:Headers = @{
     'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) GpuRetailResolver/1.0'
 }
 
 function Get-PciIdsIndex {
-    $url = 'https://pci-ids.ucw.cz/v2.2/pci.ids'
-    $raw = Invoke-RestMethod -Uri $url -Headers $Headers -TimeoutSec 20
-
+    $raw = Invoke-RestMethod -Uri 'https://pci-ids.ucw.cz/v2.2/pci.ids' -Headers $Script:Headers -TimeoutSec 20
     $vendors = @{}
-    $currentVendor = $null
-    $currentDevice = $null
+    $vendor = $null
+    $device = $null
 
     foreach ($line in ($raw -split "`r?`n")) {
-        if (-not $line -or $line.StartsWith('#')) { continue }
+        if (-not $line -or $line[0] -eq '#') { continue }
 
         if ($line -match '^([0-9a-f]{4})\s+(.+)$') {
-            $currentVendor = $matches[1].ToUpper()
-            $vendors[$currentVendor] = @{
-                Name    = $matches[2].Trim()
-                Devices = @{}
-            }
-            $currentDevice = $null
+            $vendor = $matches[1].ToUpperInvariant()
+            $device = $null
+            $vendors[$vendor] = @{ Name = $matches[2].Trim(); Devices = @{} }
         }
-        elseif ($line -match '^\t([0-9a-f]{4})\s+(.+)$' -and $currentVendor) {
-            $currentDevice = $matches[1].ToUpper()
-            $vendors[$currentVendor].Devices[$currentDevice] = @{
-                Name       = $matches[2].Trim()
-                Subsystems = @{}
-            }
+        elseif ($vendor -and $line -match '^\t([0-9a-f]{4})\s+(.+)$') {
+            $device = $matches[1].ToUpperInvariant()
+            $vendors[$vendor].Devices[$device] = @{ Name = $matches[2].Trim(); Subsystems = @{} }
         }
-        elseif ($line -match '^\t\t([0-9a-f]{4})\s+([0-9a-f]{4})\s+(.+)$' -and $currentVendor -and $currentDevice) {
-            $subVen = $matches[1].ToUpper()
-            $subDev = $matches[2].ToUpper()
-            $key = "$subVen`:$subDev"
-            $vendors[$currentVendor].Devices[$currentDevice].Subsystems[$key] = $matches[3].Trim()
+        elseif ($device -and $line -match '^\t\t([0-9a-f]{4})\s+([0-9a-f]{4})\s+(.+)$') {
+            $subKey = "$($matches[1].ToUpperInvariant()):$($matches[2].ToUpperInvariant())"
+            $vendors[$vendor].Devices[$device].Subsystems[$subKey] = $matches[3].Trim()
         }
     }
 
     return $vendors
 }
 
-function Get-LiveGpuClockMhz {
-    param(
-        [string]$VendorId,
-        [int]$GpuIndex = 0
-    )
+function Get-NvidiaClocksByIndex {
+    $smi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
+    if (-not $smi) {
+        $fallback = Join-Path $env:ProgramFiles 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'
+        if (Test-Path -LiteralPath $fallback) { $smi = Get-Item -LiteralPath $fallback }
+    }
+    if (-not $smi) { return @{} }
 
-    # 1. NVIDIA: query current or max application/boost clock via nvidia-smi (standard user)
-    if ($VendorId -eq '10DE') {
-        $nvidiaSmi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
-        if (-not $nvidiaSmi) {
-            $defaultPath = Join-Path $env:ProgramFiles 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'
-            if (Test-Path $defaultPath) { $nvidiaSmi = Get-Item $defaultPath }
-        }
+    $map = @{}
+    try {
+        $lines = & $smi.FullName --query-gpu=index,clocks.max.graphics,clocks.current.graphics --format=csv,noheader,nounits 2>$null
+        foreach ($line in @($lines)) {
+            $cols = $line -split '\s*,\s*'
+            if ($cols.Count -lt 2) { continue }
 
-        if ($nvidiaSmi) {
-            try {
-                $csv = & $nvidiaSmi.FullName -i $GpuIndex --query-gpu=clocks.max.graphics,clocks.current.graphics --format=csv,noheader,nounits 2>$null
-                if ($csv) {
-                    $parts = ($csv -split "`r?`n")[0] -split ','
-                    $maxClock = 0.0; $curClock = 0.0
-                    [double]::TryParse($parts[0].Trim(), [ref]$maxClock) | Out-Null
-                    if ($parts.Count -gt 1) { [double]::TryParse($parts[1].Trim(), [ref]$curClock) | Out-Null }
-                    if ($maxClock -gt 0) { return [math]::Round($maxClock) }
-                    if ($curClock -gt 0) { return [math]::Round($curClock) }
-                }
-            } catch { }
+            $idx = 0; $maxClk = 0.0; $curClk = 0.0
+            if (-not [int]::TryParse($cols[0], [ref]$idx)) { continue }
+            [double]::TryParse($cols[1], [ref]$maxClk) | Out-Null
+            if ($cols.Count -gt 2) { [double]::TryParse($cols[2], [ref]$curClk) | Out-Null }
+
+            $best = if ($maxClk -gt 0) { [int][math]::Round($maxClk) }
+                    elseif ($curClk -gt 0) { [int][math]::Round($curClk) }
+                    else { $null }
+
+            if ($null -ne $best) { $map[$idx] = $best }
         }
     }
+    catch {
+        Write-Verbose "nvidia-smi query failed: $($_.Exception.Message)"
+    }
 
-    # 2. Fallback: Windows WMI / CIM performance counter or driver properties if exposed
-    try {
-        $perf = Get-CimInstance -Namespace 'root\cimv2' -ClassName 'Win32_PerfFormattedData_Counters_GPUProcessMemory' -ErrorAction SilentlyContinue
-        if ($perf) { return $null }
-    } catch { }
-
-    return $null
+    return $map
 }
 
 function Search-TechPowerUpVbios {
@@ -104,159 +83,145 @@ function Search-TechPowerUpVbios {
         [string]$SubDeviceId
     )
 
-    $uri = "https://www.techpowerup.com/vgabios/?did=$($VendorId)-$($DeviceId)-$($SubVendorId)-$($SubDeviceId)"
-    $results = [System.Collections.Generic.List[object]]::new()
+    $uri = "https://www.techpowerup.com/vgabios/?did=$VendorId-$DeviceId-$SubVendorId-$SubDeviceId"
+    $editionPattern = '([A-Za-z0-9\-\+\s\(\)\/]+?(?:OC|Gaming|Strix|TUF|Ventus|Suprim|Pulse|Nitro\+|Hellhound|Red Devil|Eagle|Windforce|Aero|ProArt|Phantom|Taichi|Founders Edition|Reference)[^\d\|]*)'
+    $seen = @{}
 
     try {
-        $resp = Invoke-WebRequest -Uri $uri -Headers $Headers -TimeoutSec 20
-        $html = [string]$resp.Content
-
-        $rowMatches = [regex]::Matches(
-            $html,
+        $resp = Invoke-WebRequest -Uri $uri -Headers $Script:Headers -TimeoutSec 20
+        $rows = [regex]::Matches(
+            [string]$resp.Content,
             '<tr[^>]*>(.*?)</tr>',
             [System.Text.RegularExpressions.RegexOptions]::Singleline -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
         )
 
-        foreach ($row in $rowMatches) {
-            $rowHtml = $row.Groups[1].Value
-            $cleanText = [System.Net.WebUtility]::HtmlDecode(($rowHtml -replace '<[^>]+>', ' ')) -replace '\s+', ' '
-            $cleanText = $cleanText.Trim()
+        foreach ($row in $rows) {
+            $text = [System.Net.WebUtility]::HtmlDecode(($row.Groups[1].Value -replace '<[^>]+>', ' ')) -replace '\s+', ' '
+            $text = $text.Trim()
+            if (-not $text -or $text -notmatch $editionPattern) { continue }
 
-            if ([string]::IsNullOrWhiteSpace($cleanText)) { continue }
+            $name = ($matches[1] -replace '\s+', ' ').Trim()
+            if ($name.Length -lt 4 -or $name.Length -gt 120) { continue }
 
-            if ($cleanText -match '([A-Za-z0-9\-\+\s\(\)\/]+?(?:OC|Gaming|Strix|TUF|Ventus|Suprim|Pulse|Nitro\+|Hellhound|Red Devil|Eagle|Windforce|Aero|ProArt|Phantom|Taichi|Founders Edition|Reference)[^\d\|]*)') {
-                $candidateName = ($matches[1] -replace '\s+', ' ').Trim()
-                $mhz = $null
-                if ($cleanText -match '(\d{3,4})\s*MHz') {
-                    $mhz = [int]$matches[1]
-                }
+            $mhz = if ($text -match '(\d{3,4})\s*MHz') { [int]$matches[1] } else { $null }
+            $dedupKey = "$name|$mhz"
 
-                if ($candidateName.Length -ge 4 -and $candidateName.Length -le 120) {
-                    $results.Add([PSCustomObject]@{
-                        EditionName = $candidateName
-                        ClockMhz    = $mhz
-                        Source      = 'TechPowerUp VBIOS'
-                    })
+            if (-not $seen.ContainsKey($dedupKey)) {
+                $seen[$dedupKey] = [PSCustomObject]@{
+                    EditionName = $name
+                    ClockMhz    = $mhz
+                    Source      = 'TechPowerUp VBIOS'
                 }
             }
         }
-    } catch {
+    }
+    catch {
         Write-Verbose "TechPowerUp lookup failed: $($_.Exception.Message)"
     }
 
-    if ($results.Count -eq 0) {
-        return @()
-    }
-
-    $deduped = @(
-        $results | Group-Object EditionName, ClockMhz | ForEach-Object {
-            @($_.Group)[0]
-        }
-    )
-
-    return $deduped
+    return @($seen.Values)
 }
 
-function Select-BestCandidateWithClockTieBreak {
+function Select-BestCandidate {
     param(
-        [AllowEmptyCollection()]
-        [object[]]$Candidates = @(),
+        [AllowEmptyCollection()][object[]]$Candidates = @(),
         [Nullable[int]]$LiveClockMhz
     )
 
-    $candidateList = @($Candidates)
-    if ($candidateList.Count -eq 0) {
-        return $null
+    $list = @($Candidates)
+    if ($list.Count -eq 0) { return $null }
+
+    if ($null -ne $LiveClockMhz) {
+        $clocked = @($list | Where-Object { $null -ne $_.ClockMhz })
+        if ($clocked.Count -gt 0) {
+            return (@($clocked | Sort-Object { [math]::Abs([int]$_.ClockMhz - $LiveClockMhz) }))[0]
+        }
     }
 
-    if ($candidateList.Count -eq 1) {
-        return $candidateList[0]
-    }
-
-    $clocked = @($candidateList | Where-Object { $null -ne $_.ClockMhz })
-    if ($null -ne $LiveClockMhz -and $clocked.Count -gt 0) {
-        return (@($clocked | Sort-Object { [math]::Abs([int]$_.ClockMhz - [int]$LiveClockMhz) }))[0]
-    }
-
-    return $candidateList[0]
+    return $list[0]
 }
 
-Write-Host "Fetching live pci.ids reference index..." -ForegroundColor Cyan
+Write-Verbose 'Fetching live pci.ids reference index...'
 $pciIndex = Get-PciIdsIndex
+$nvidiaClocks = Get-NvidiaClocksByIndex
+$nvOrdinal = 0
 
-$controllers = Get-CimInstance Win32_VideoController
-$gpuIndex = 0
-
-foreach ($ctrl in $controllers) {
+foreach ($ctrl in (Get-CimInstance -ClassName Win32_VideoController)) {
     if ($ctrl.PNPDeviceID -notmatch 'VEN_([0-9A-F]{4})&DEV_([0-9A-F]{4})&SUBSYS_([0-9A-F]{4})([0-9A-F]{4})') {
         continue
     }
 
-    $ven = $matches[1].ToUpper()
-    $dev = $matches[2].ToUpper()
-    $subDev = $matches[3].ToUpper()
-    $subVen = $matches[4].ToUpper()
-    $subsysKey = "$subVen`:$subDev"
+    $ven = $matches[1].ToUpperInvariant()
+    $dev = $matches[2].ToUpperInvariant()
+    $subDev = $matches[3].ToUpperInvariant()
+    $subVen = $matches[4].ToUpperInvariant()
+    $subKey = "$subVen`:$subDev"
 
-    # Skip typical Intel integrated graphics unless requested
     if (-not $IncludeIntegrated -and $ven -eq '8086' -and $ctrl.Name -notmatch 'Arc') {
         continue
     }
 
-    $liveClock = Get-LiveGpuClockMhz -VendorId $ven -GpuIndex $gpuIndex
-    $gpuIndex++
+    $liveClock = $null
+    if ($ven -eq '10DE') {
+        if ($nvidiaClocks.ContainsKey($nvOrdinal)) { $liveClock = $nvidiaClocks[$nvOrdinal] }
+        $nvOrdinal++
+    }
 
-    $pciSubsysName = $null
     $baseChipName = $ctrl.Name
-    if ($pciIndex.ContainsKey($ven) -and $pciIndex[$ven].Devices.ContainsKey($dev)) {
-        $baseChipName = $pciIndex[$ven].Devices[$dev].Name
-        if ($pciIndex[$ven].Devices[$dev].Subsystems.ContainsKey($subsysKey)) {
-            $pciSubsysName = $pciIndex[$ven].Devices[$dev].Subsystems[$subsysKey]
+    $pciSubsysName = $null
+    $devEntry = if ($pciIndex.ContainsKey($ven) -and $pciIndex[$ven].Devices.ContainsKey($dev)) {
+        $pciIndex[$ven].Devices[$dev]
+    } else { $null }
+
+    if ($devEntry) {
+        $baseChipName = $devEntry.Name
+        if ($devEntry.Subsystems.ContainsKey($subKey)) {
+            $pciSubsysName = $devEntry.Subsystems[$subKey]
         }
     }
 
-    $candidates = [System.Collections.Generic.List[object]]::new()
+    $byEdition = @{}
+    $addCandidate = {
+        param($Name, $ClockMhz, $Source)
+        if (-not $Name) { return }
+        if (-not $byEdition.ContainsKey($Name)) {
+            $byEdition[$Name] = [PSCustomObject]@{
+                EditionName = $Name
+                ClockMhz    = $ClockMhz
+                Source      = $Source
+            }
+        }
+        elseif ($null -eq $byEdition[$Name].ClockMhz -and $null -ne $ClockMhz) {
+            $byEdition[$Name].ClockMhz = $ClockMhz
+        }
+    }
 
-    if (($ven -eq '10DE' -and $subVen -eq '10DE') -or ($ven -eq '1002' -and $subVen -eq '1002')) {
-        $refLabel = if ($ven -eq '10DE') { "$baseChipName (Founders Edition / Reference)" } else { "$baseChipName (AMD Reference)" }
-        $candidates.Add([PSCustomObject]@{
-            EditionName = $refLabel
-            ClockMhz    = $null
-            Source      = 'PCI Subsystem Rule'
-        })
+    if ($ven -eq '10DE' -and $subVen -eq '10DE') {
+        & $addCandidate "$baseChipName (Founders Edition / Reference)" $null 'PCI Subsystem Rule'
+    }
+    elseif ($ven -eq '1002' -and $subVen -eq '1002') {
+        & $addCandidate "$baseChipName (AMD Reference)" $null 'PCI Subsystem Rule'
     }
 
     if ($pciSubsysName) {
-        $candidates.Add([PSCustomObject]@{
-            EditionName = $pciSubsysName
-            ClockMhz    = $null
-            Source      = 'pci.ids'
-        })
+        & $addCandidate $pciSubsysName $null 'pci.ids'
     }
 
-    $tpuMatches = @(Search-TechPowerUpVbios -VendorId $ven -DeviceId $dev -SubVendorId $subVen -SubDeviceId $subDev)
-    foreach ($match in $tpuMatches) {
-        $candidates.Add($match)
+    foreach ($tpu in (Search-TechPowerUpVbios -VendorId $ven -DeviceId $dev -SubVendorId $subVen -SubDeviceId $subDev)) {
+        & $addCandidate $tpu.EditionName $tpu.ClockMhz $tpu.Source
     }
 
-    $uniqueCandidates = @(
-        if ($candidates.Count -gt 0) {
-            $candidates | Group-Object EditionName | ForEach-Object {
-                (@($_.Group) | Sort-Object { if ($null -ne $_.ClockMhz) { 0 } else { 1 } })[0]
-            }
-        }
-    )
-
-    $chosen = Select-BestCandidateWithClockTieBreak -Candidates $uniqueCandidates -LiveClockMhz $liveClock
+    $uniqueCandidates = @($byEdition.Values)
+    $chosen = Select-BestCandidate -Candidates $uniqueCandidates -LiveClockMhz $liveClock
 
     [PSCustomObject]@{
-        WindowsName     = $ctrl.Name
-        BaseChip        = $baseChipName
-        PciIdsSubsys    = if ($pciSubsysName) { $pciSubsysName } else { '<Not in pci.ids>' }
-        LiveClockMhz    = if ($null -ne $liveClock) { $liveClock } else { '<Unavailable>' }
-        CandidateCount  = @($uniqueCandidates).Count
-        DerivedEdition  = if ($null -ne $chosen) { $chosen.EditionName } else { "$baseChipName (SUBSYS $subsysKey)" }
-        ResolvedVia     = if ($null -ne $chosen) { $chosen.Source } else { 'Fallback Base Chip' }
-        HardwareId      = "PCI\VEN_$ven&DEV_$dev&SUBSYS_$subDev$subVen"
+        WindowsName    = $ctrl.Name
+        BaseChip       = $baseChipName
+        PciIdsSubsys   = $pciSubsysName
+        LiveClockMhz   = $liveClock
+        CandidateCount = $uniqueCandidates.Count
+        DerivedEdition = if ($chosen) { $chosen.EditionName } else { "$baseChipName (SUBSYS $subKey)" }
+        ResolvedVia    = if ($chosen) { $chosen.Source } else { 'Fallback Base Chip' }
+        HardwareId     = "PCI\VEN_$ven&DEV_$dev&SUBSYS_$subDev$subVen"
     }
 }
